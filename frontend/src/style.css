@@ -156,10 +156,30 @@ h2 {
 
 .editor-controls {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(220px, 1fr) auto;
   align-items: end;
   gap: 24px;
   margin-bottom: 24px;
+}
+
+.puzzle-picker {
+  display: grid;
+  gap: 8px;
+  color: #59645b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.puzzle-picker select {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid #dfe4dc;
+  border-radius: 10px;
+  outline: none;
+  background: #fff;
+  color: #242a25;
+  font: inherit;
 }
 
 .title-field,
@@ -202,6 +222,7 @@ h2 {
 }
 
 .title-field input:focus,
+.puzzle-picker select:focus,
 .size-controls input:focus {
   border-color: #739779;
   box-shadow: 0 0 0 3px rgb(115 151 121 / 15%);
@@ -260,6 +281,21 @@ h2 {
   background: #f5f8f3;
 }
 
+.delete-button {
+  border-color: #edd7d2;
+  color: #a74435;
+}
+
+.delete-button:hover:not(:disabled) {
+  border-color: #d98b7e;
+  background: #fff5f2;
+}
+
+.delete-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .secondary-button--selected {
   border-color: #739779;
   background: #edf4eb;
@@ -276,6 +312,10 @@ h2 {
   text-align: center;
 }
 
+.grid-container {
+  position: relative;
+}
+
 .grid-viewport {
   max-height: min(62vh, 720px);
   min-height: 70px;
@@ -283,6 +323,42 @@ h2 {
   border: 1px solid #d8ded5;
   border-radius: 12px;
   background: #d8ded5;
+}
+
+.grid-loading-overlay {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  border-radius: 12px;
+  background: rgb(248 250 246 / 88%);
+  color: #415246;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.grid-loading-spinner {
+  width: 36px;
+  height: 36px;
+  border: 4px solid #dfe7dd;
+  border-top-color: #547a5a;
+  border-radius: 50%;
+  animation: grid-loading-spin 0.8s linear infinite;
+}
+
+@keyframes grid-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .grid-loading-spinner {
+    animation: none;
+  }
 }
 
 .letter-grid {
@@ -322,8 +398,25 @@ h2 {
   background: #d8e5d5;
 }
 
+.hint-cell--hint-tool-active:enabled {
+  cursor: copy;
+  touch-action: none;
+}
+
+.hint-cell--range-selected:enabled,
+.hint-cell--range-selected:enabled:hover {
+  outline: 3px solid #365c3e;
+  outline-offset: -3px;
+  background: #dce8d8;
+}
+
 .hint-cell--filled {
   background: #dce8d8;
+}
+
+.hint-cell--spanned {
+  width: 100%;
+  height: 100%;
 }
 
 .hint-cell img {
@@ -365,10 +458,28 @@ h2 {
   background: #e6e9e3;
 }
 
+.grid-cell--range-selected,
+.grid-cell--range-selected:focus {
+  outline: 3px solid #365c3e;
+  outline-offset: -3px;
+  background: #dce8d8;
+}
+
 .editor-footer {
   min-height: 54px;
   gap: 20px;
   margin-top: 20px;
+}
+
+.editor-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.print-preview {
+  display: none;
 }
 
 .feedback-area {
@@ -466,7 +577,13 @@ h2 {
   font-weight: 650;
 }
 
-.hint-direction-field {
+.hint-span-control {
+  display: grid;
+  grid-template-columns: repeat(2, max-content);
+  gap: 4px;
+}
+
+.hint-span-field {
   display: inline-flex;
   min-height: 38px;
   align-items: center;
@@ -479,7 +596,7 @@ h2 {
   font-weight: 650;
 }
 
-.hint-direction-field select {
+.hint-span-field select {
   height: 28px;
   padding: 0 8px;
   border: 1px solid #dfe4dc;
@@ -535,9 +652,19 @@ h2 {
   box-shadow: 0 0 0 3px rgb(115 151 121 / 15%);
 }
 
+.hint-canvas-frame {
+  display: grid;
+  width: min(100%, 360px);
+  aspect-ratio: 1;
+  margin-inline: auto;
+  place-items: center;
+}
+
 .hint-canvas {
   display: block;
-  width: min(100%, 640px);
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
   height: auto;
   border: 1px solid #d8ded5;
   border-radius: 8px;
@@ -606,6 +733,11 @@ h2 {
     flex-direction: column;
   }
 
+  .editor-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .hint-editor-backdrop {
     padding: 10px;
   }
@@ -626,5 +758,71 @@ h2 {
 
   .primary-button {
     width: 100%;
+  }
+}
+
+@page {
+  margin: 12mm;
+}
+
+@media print {
+  html,
+  body,
+  #root {
+    min-height: 0;
+    background: #fff;
+  }
+
+  body {
+    min-width: 0;
+  }
+
+  .page {
+    min-height: 0;
+    padding: 0;
+    background: #fff;
+  }
+
+  .app-shell,
+  .hint-editor-backdrop {
+    display: none !important;
+  }
+
+  .print-preview {
+    display: block;
+    color: #111;
+    font-family: 'Segoe UI', sans-serif;
+  }
+
+  .print-preview h1 {
+    margin: 0 0 8mm;
+    font-size: 22pt;
+  }
+
+  .print-grid {
+    table-layout: fixed;
+    border-collapse: collapse;
+    break-inside: avoid;
+  }
+
+  .print-cell {
+    padding: 0;
+    vertical-align: middle;
+  }
+
+  .print-cell--letter {
+    border: 0.25mm solid #111;
+  }
+
+  .print-cell--hint {
+    overflow: hidden;
+    border: 0;
+  }
+
+  .print-cell--hint img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
   }
 }

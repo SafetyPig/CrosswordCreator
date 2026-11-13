@@ -10,6 +10,7 @@
 **/node_modules/
 **/dist/
 npm-debug.log*
+.crosswordcreator-runtime/
 
 # IDE
 .vs/

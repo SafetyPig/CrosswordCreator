@@ -1,20 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, PointerEvent as ReactPointerEvent } from 'react'
 
-const CANVAS_WIDTH = 640
-const CANVAS_HEIGHT = 360
-
-type HintDirection = 'across' | 'down'
+const CANVAS_MAX_SIZE = 360
 
 interface HintEditorProps {
   title: string
-  direction: HintDirection
   imageId?: string
+  rowSpan?: number
+  columnSpan?: number
+  rowSpanOptions?: number[]
+  columnSpanOptions?: number[]
   onCancel: () => void
-  onEscape: () => void
-  onDirectionChange: (direction: HintDirection) => void
+  onDimensionsChange?: (rowSpan: number, columnSpan: number) => void
   onSave: (image: Blob) => Promise<string>
-  onSaved: (imageId: string) => void
+  onSaved: (imageId: string | null) => void
   onRemove?: () => void
 }
 
@@ -24,46 +23,57 @@ function drawImageOnCanvas(canvas: HTMLCanvasElement, image: HTMLImageElement) {
     throw new Error('The drawing canvas is unavailable.')
   }
 
+  const { width, height } = canvas
   context.fillStyle = '#fff'
-  context.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+  context.fillRect(0, 0, width, height)
 
   const scale = Math.min(
-    CANVAS_WIDTH / image.naturalWidth,
-    CANVAS_HEIGHT / image.naturalHeight,
+    width / image.naturalWidth,
+    height / image.naturalHeight,
   )
-  const width = image.naturalWidth * scale
-  const height = image.naturalHeight * scale
+  const imageWidth = image.naturalWidth * scale
+  const imageHeight = image.naturalHeight * scale
   context.drawImage(
     image,
-    (CANVAS_WIDTH - width) / 2,
-    (CANVAS_HEIGHT - height) / 2,
-    width,
-    height,
+    (width - imageWidth) / 2,
+    (height - imageHeight) / 2,
+    imageWidth,
+    imageHeight,
   )
 }
 
 function canvasPoint(event: ReactPointerEvent<HTMLCanvasElement>) {
-  const bounds = event.currentTarget.getBoundingClientRect()
+  const canvas = event.currentTarget
+  const bounds = canvas.getBoundingClientRect()
   return {
-    x: (event.clientX - bounds.left) * (CANVAS_WIDTH / bounds.width),
-    y: (event.clientY - bounds.top) * (CANVAS_HEIGHT / bounds.height),
+    x: (event.clientX - bounds.left) * (canvas.width / bounds.width),
+    y: (event.clientY - bounds.top) * (canvas.height / bounds.height),
   }
 }
 
 function HintEditor({
   title,
-  direction,
   imageId,
+  rowSpan,
+  columnSpan,
+  rowSpanOptions,
+  columnSpanOptions,
   onCancel,
-  onEscape,
-  onDirectionChange,
+  onDimensionsChange,
   onSave,
   onSaved,
   onRemove,
 }: HintEditorProps) {
+  const rows = rowSpan ?? 1
+  const columns = columnSpan ?? 1
+  const longestSide = Math.max(rows, columns)
+  const canvasWidth = Math.round(CANVAS_MAX_SIZE * columns / longestSide)
+  const canvasHeight = Math.round(CANVAS_MAX_SIZE * rows / longestSide)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const pendingResizeCanvas = useRef<HTMLCanvasElement | null>(null)
   const isDrawing = useRef(false)
   const hasUnsavedChanges = useRef(false)
+  const shouldRemoveImage = useRef(false)
   const [tool, setTool] = useState<'draw' | 'text'>('draw')
   const [color, setColor] = useState('#263c2b')
   const [text, setText] = useState('')
@@ -79,9 +89,18 @@ function HintEditor({
       return
     }
 
+    const previousCanvas = pendingResizeCanvas.current
+    pendingResizeCanvas.current = null
+    if (previousCanvas) {
+      context.drawImage(previousCanvas, 0, 0, canvas.width, canvas.height)
+      setIsLoadingImage(false)
+      return
+    }
+
     context.fillStyle = '#fff'
-    context.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+    context.fillRect(0, 0, canvas.width, canvas.height)
     hasUnsavedChanges.current = false
+    shouldRemoveImage.current = false
     if (!imageId) {
       setIsLoadingImage(false)
       return
@@ -109,7 +128,26 @@ function HintEditor({
       image.onload = null
       image.onerror = null
     }
-  }, [imageId])
+  }, [canvasHeight, canvasWidth, imageId])
+
+  function handleDimensionsChange(nextRows: number, nextColumns: number) {
+    const canvas = canvasRef.current
+    if (canvas) {
+      const previousCanvas = document.createElement('canvas')
+      previousCanvas.width = canvas.width
+      previousCanvas.height = canvas.height
+      const context = previousCanvas.getContext('2d')
+      if (!context) {
+        setError('The drawing canvas is unavailable.')
+        return
+      }
+
+      context.drawImage(canvas, 0, 0)
+      pendingResizeCanvas.current = previousCanvas
+    }
+
+    onDimensionsChange?.(nextRows, nextColumns)
+  }
 
   function handleImageUpload(event: ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0]
@@ -135,6 +173,7 @@ function HintEditor({
 
         drawImageOnCanvas(canvas, image)
         hasUnsavedChanges.current = true
+        shouldRemoveImage.current = false
         setError(null)
       } catch (loadError) {
         setError(loadError instanceof Error ? loadError.message : 'Unable to load the selected image.')
@@ -171,10 +210,11 @@ function HintEditor({
       }
 
       context.fillStyle = color
-      context.font = '24px Segoe UI, sans-serif'
+      context.font = `${24 / longestSide}px Segoe UI, sans-serif`
       context.textBaseline = 'top'
-      context.fillText(text.trim(), point.x, point.y, CANVAS_WIDTH - point.x)
+      context.fillText(text.trim(), point.x, point.y, canvas.width - point.x)
       hasUnsavedChanges.current = true
+      shouldRemoveImage.current = false
       setError(null)
       return
     }
@@ -184,9 +224,10 @@ function HintEditor({
     context.beginPath()
     context.moveTo(point.x, point.y)
     context.strokeStyle = color
-    context.lineWidth = 5
+    context.lineWidth = 5 / longestSide
     context.lineCap = 'round'
     context.lineJoin = 'round'
+    shouldRemoveImage.current = false
   }
 
   function handlePointerMove(event: ReactPointerEvent<HTMLCanvasElement>) {
@@ -205,6 +246,7 @@ function HintEditor({
     context.lineTo(point.x, point.y)
     context.stroke()
     hasUnsavedChanges.current = true
+    shouldRemoveImage.current = false
   }
 
   function stopDrawing(event: ReactPointerEvent<HTMLCanvasElement>) {
@@ -227,7 +269,8 @@ function HintEditor({
     }
 
     context.fillStyle = '#fff'
-    context.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+    context.fillRect(0, 0, canvas.width, canvas.height)
+    shouldRemoveImage.current = Boolean(imageId) || hasUnsavedChanges.current
     hasUnsavedChanges.current = Boolean(imageId)
     setError(null)
   }
@@ -256,14 +299,12 @@ function HintEditor({
 
       event.preventDefault()
       event.stopPropagation()
-      if (requestClose()) {
-        onEscape()
-      }
+      requestClose()
     }
 
     window.addEventListener('keydown', handleEscape)
     return () => window.removeEventListener('keydown', handleEscape)
-  }, [onEscape, requestClose])
+  }, [requestClose])
 
   function requestRemove() {
     if (
@@ -284,6 +325,12 @@ function HintEditor({
     }
 
     setIsSaving(true)
+    if (shouldRemoveImage.current) {
+      setIsSaving(false)
+      onSaved(null)
+      return
+    }
+
     let imageId: string
     try {
       const image = await new Promise<Blob>((resolve, reject) => {
@@ -330,21 +377,6 @@ function HintEditor({
         </div>
 
         <div className="hint-editor-tools">
-          <label className="hint-direction-field">
-            <span>Answer direction</span>
-            <select
-              value={direction}
-              onChange={(event) => {
-                const value = event.currentTarget.value
-                if (value === 'across' || value === 'down') {
-                  onDirectionChange(value)
-                }
-              }}
-            >
-              <option value="across">Across (to the right)</option>
-              <option value="down">Down (below)</option>
-            </select>
-          </label>
           <button
             className={`secondary-button${tool === 'draw' ? ' secondary-button--selected' : ''}`}
             type="button"
@@ -352,14 +384,6 @@ function HintEditor({
             onClick={() => setTool('draw')}
           >
             Draw
-          </button>
-          <button
-            className={`secondary-button${tool === 'text' ? ' secondary-button--selected' : ''}`}
-            type="button"
-            aria-pressed={tool === 'text'}
-            onClick={() => setTool('text')}
-          >
-            Add text
           </button>
           <label className="hint-color-field">
             <span>Color</span>
@@ -369,6 +393,14 @@ function HintEditor({
               onChange={(event) => setColor(event.currentTarget.value)}
             />
           </label>
+          <button
+            className={`secondary-button${tool === 'text' ? ' secondary-button--selected' : ''}`}
+            type="button"
+            aria-pressed={tool === 'text'}
+            onClick={() => setTool('text')}
+          >
+            Add text
+          </button>
           <label className="secondary-button upload-button">
             Upload image
             <input
@@ -378,6 +410,50 @@ function HintEditor({
               onChange={handleImageUpload}
             />
           </label>
+          {rowSpan !== undefined
+            && columnSpan !== undefined
+            && rowSpanOptions
+            && columnSpanOptions
+            && onDimensionsChange && (
+              <div className="hint-span-control">
+                <label className="hint-span-field" htmlFor="hint-row-span">
+                  <span>Rows</span>
+                  <select
+                    id="hint-row-span"
+                    value={rowSpan}
+                    disabled={isLoadingImage || isSaving}
+                    onChange={(event) => handleDimensionsChange(
+                      Number(event.currentTarget.value),
+                      columnSpan,
+                    )}
+                  >
+                    {rowSpanOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="hint-span-field" htmlFor="hint-column-span">
+                  <span>Columns</span>
+                  <select
+                    id="hint-column-span"
+                    value={columnSpan}
+                    disabled={isLoadingImage || isSaving}
+                    onChange={(event) => handleDimensionsChange(
+                      rowSpan,
+                      Number(event.currentTarget.value),
+                    )}
+                  >
+                    {columnSpanOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
           <button
             className="secondary-button"
             type="button"
@@ -401,17 +477,19 @@ function HintEditor({
           </label>
         )}
 
-        <canvas
-          ref={canvasRef}
-          className="hint-canvas"
-          width={CANVAS_WIDTH}
-          height={CANVAS_HEIGHT}
-          aria-label="Hint drawing canvas"
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={stopDrawing}
-          onPointerCancel={stopDrawing}
-        />
+        <div className="hint-canvas-frame">
+          <canvas
+            ref={canvasRef}
+            className="hint-canvas"
+            width={canvasWidth}
+            height={canvasHeight}
+            aria-label="Hint drawing canvas"
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={stopDrawing}
+            onPointerCancel={stopDrawing}
+          />
+        </div>
         <p className="hint-canvas-help">
           Draw with the pointer, or select Add text and click to place text.
         </p>

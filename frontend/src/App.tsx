@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import HintEditor from './HintEditor'
 
@@ -14,12 +14,25 @@ interface SavedPuzzle {
   title: string
 }
 
+interface PuzzleContent {
+  width: number
+  height: number
+  cells: string[]
+  hints?: HintTileData[]
+}
+
+interface PuzzleResponse extends SavedPuzzle {
+  content: PuzzleContent
+}
+
 interface GridCellProps {
   row: number
   column: number
   value: string
   tabIndex: number
   hintToolActive: boolean
+  rangeSelected: boolean
+  onPointerDown: (row: number, column: number, pointerId: number) => void
   onChange: (row: number, column: number, value: string) => void
   onKeyDown: (row: number, column: number, value: string, event: KeyboardEvent<HTMLInputElement>) => void
   onHintClick: (row: number, column: number, value: string) => void
@@ -31,15 +44,37 @@ interface ActiveHint {
   direction: 'across' | 'down'
 }
 
+interface HintPosition {
+  row: number
+  column: number
+}
+
+interface HintDragSelection {
+  start: HintPosition
+  end: HintPosition
+  pointerId: number
+}
+
 interface HintTile extends ActiveHint {
   imageId: string | null
+  rowSpan: number
+  columnSpan: number
+}
+
+interface HintTileData extends ActiveHint {
+  imageId: string | null
+  rowSpan?: number
+  columnSpan?: number
+  span?: number
 }
 
 interface HintTileCellProps {
   row: number
   column: number
   tile: HintTile
-  enabled: boolean
+  hintToolActive: boolean
+  rangeSelected: boolean
+  onPointerDown: (row: number, column: number, pointerId: number) => void
   onClick: () => void
 }
 
@@ -56,6 +91,8 @@ function createDefaultHintTiles(width: number, height: number) {
       column: 0,
       direction: 'across',
       imageId: null,
+      rowSpan: 1,
+      columnSpan: 1,
     }
   }
 
@@ -65,6 +102,8 @@ function createDefaultHintTiles(width: number, height: number) {
       column,
       direction: 'down',
       imageId: null,
+      rowSpan: 1,
+      columnSpan: 1,
     }
   }
 
@@ -75,6 +114,192 @@ function hintPositionKey(row: number, column: number) {
   return `${row}:${column}`
 }
 
+function getCoveredHintPositionKeys(hintTiles: Record<string, HintTile>) {
+  const covered = new Set<string>()
+  for (const tile of Object.values(hintTiles)) {
+    for (let rowOffset = 0; rowOffset < tile.rowSpan; rowOffset += 1) {
+      for (let columnOffset = 0; columnOffset < tile.columnSpan; columnOffset += 1) {
+        if (rowOffset !== 0 || columnOffset !== 0) {
+          covered.add(hintPositionKey(tile.row + rowOffset, tile.column + columnOffset))
+        }
+      }
+    }
+  }
+
+  return covered
+}
+
+function getHintRectangle(tile: Pick<HintTile, 'row' | 'column' | 'rowSpan' | 'columnSpan'>) {
+  return {
+    row: tile.row,
+    column: tile.column,
+    rowSpan: tile.rowSpan,
+    columnSpan: tile.columnSpan,
+  }
+}
+
+function hintRectanglesOverlap(
+  first: ReturnType<typeof getHintRectangle>,
+  second: ReturnType<typeof getHintRectangle>,
+) {
+  return first.row < second.row + second.rowSpan
+    && second.row < first.row + first.rowSpan
+    && first.column < second.column + second.columnSpan
+    && second.column < first.column + first.columnSpan
+}
+
+function hintRectangleContains(
+  outer: ReturnType<typeof getHintRectangle>,
+  inner: ReturnType<typeof getHintRectangle>,
+) {
+  return outer.row <= inner.row
+    && outer.column <= inner.column
+    && outer.row + outer.rowSpan >= inner.row + inner.rowSpan
+    && outer.column + outer.columnSpan >= inner.column + inner.columnSpan
+}
+
+function getHintSelectionRectangle(
+  selection: HintDragSelection | null,
+  hintTiles: Record<string, HintTile>,
+  width: number,
+  height: number,
+) {
+  if (!selection) {
+    return null
+  }
+
+  const rectangle = {
+    row: Math.min(selection.start.row, selection.end.row),
+    column: Math.min(selection.start.column, selection.end.column),
+    rowSpan: Math.abs(selection.start.row - selection.end.row) + 1,
+    columnSpan: Math.abs(selection.start.column - selection.end.column) + 1,
+  }
+
+  let expanded = true
+  while (expanded) {
+    expanded = false
+    for (const tile of Object.values(hintTiles)) {
+      const tileRectangle = getHintRectangle(tile)
+      if (hintRectanglesOverlap(rectangle, tileRectangle)
+        && !hintRectangleContains(rectangle, tileRectangle)) {
+        const bottom = Math.max(
+          rectangle.row + rectangle.rowSpan,
+          tileRectangle.row + tileRectangle.rowSpan,
+        )
+        const right = Math.max(
+          rectangle.column + rectangle.columnSpan,
+          tileRectangle.column + tileRectangle.columnSpan,
+        )
+        rectangle.row = Math.min(rectangle.row, tileRectangle.row)
+        rectangle.column = Math.min(rectangle.column, tileRectangle.column)
+        rectangle.rowSpan = bottom - rectangle.row
+        rectangle.columnSpan = right - rectangle.column
+        expanded = true
+      }
+    }
+  }
+
+  if (
+    rectangle.row < 0
+    || rectangle.column < 0
+    || rectangle.row + rectangle.rowSpan > height
+    || rectangle.column + rectangle.columnSpan > width
+  ) {
+    return null
+  }
+
+  return rectangle
+}
+
+function getHintSelectionTileKeys(
+  selectionRectangle: ReturnType<typeof getHintSelectionRectangle>,
+  hintTiles: Record<string, HintTile>,
+) {
+  const selected = new Set<string>()
+  if (!selectionRectangle) {
+    return selected
+  }
+
+  for (const tile of Object.values(hintTiles)) {
+    if (hintRectanglesOverlap(selectionRectangle, getHintRectangle(tile))) {
+      selected.add(hintPositionKey(tile.row, tile.column))
+    }
+  }
+
+  return selected
+}
+
+function getHintTilePositionFromPointerEvent(
+  event: globalThis.PointerEvent,
+) {
+  if (!(event.target instanceof Element)) {
+    return null
+  }
+
+  const gridCell = event.target.closest<HTMLElement>('[data-grid-row][data-grid-column]')
+  if (!gridCell) {
+    return null
+  }
+
+  const row = Number(gridCell.dataset.gridRow)
+  const column = Number(gridCell.dataset.gridColumn)
+  const rowSpan = Number(gridCell.dataset.rowSpan ?? 1)
+  const columnSpan = Number(gridCell.dataset.columnSpan ?? 1)
+  const bounds = gridCell.getBoundingClientRect()
+  const rowStep = (bounds.height + rowSpan - 1) / rowSpan
+  const columnStep = (bounds.width + columnSpan - 1) / columnSpan
+  const rowOffset = Math.min(rowSpan - 1, Math.floor((event.clientY - bounds.top) / rowStep))
+  const columnOffset = Math.min(
+    columnSpan - 1,
+    Math.floor((event.clientX - bounds.left) / columnStep),
+  )
+
+  return {
+    row: row + rowOffset,
+    column: column + columnOffset,
+  }
+}
+
+function getHintDimensionOptions(
+  tile: HintTile,
+  hintTiles: Record<string, HintTile>,
+  width: number,
+  height: number,
+  dimension: 'rows' | 'columns',
+) {
+  const maximum = dimension === 'rows'
+    ? height - tile.row
+    : width - tile.column
+
+  return Array.from({ length: maximum }, (_, index) => index + 1).filter((size) => {
+    const candidate = {
+      row: tile.row,
+      column: tile.column,
+      rowSpan: dimension === 'rows' ? size : tile.rowSpan,
+      columnSpan: dimension === 'columns' ? size : tile.columnSpan,
+    }
+
+    return Object.values(hintTiles).every((otherTile) => {
+      if (otherTile.row === tile.row && otherTile.column === tile.column) {
+        return true
+      }
+
+      const otherRectangle = getHintRectangle(otherTile)
+      return !hintRectanglesOverlap(candidate, otherRectangle)
+        || hintRectangleContains(candidate, otherRectangle)
+    })
+  })
+}
+
+function isSavedPuzzle(value: unknown): value is SavedPuzzle {
+  return typeof value === 'object'
+    && value !== null
+    && 'id' in value
+    && typeof value.id === 'string'
+    && 'title' in value
+    && typeof value.title === 'string'
+}
+
 function getGridTraversalOrder(
   width: number,
   height: number,
@@ -82,10 +307,12 @@ function getGridTraversalOrder(
   direction: 'right' | 'down',
 ) {
   const cells: Array<{ row: number; column: number }> = []
+  const coveredHintKeys = getCoveredHintPositionKeys(hintTiles)
   if (direction === 'down') {
     for (let column = 0; column < width; column += 1) {
       for (let row = 0; row < height; row += 1) {
-        if (!hintTiles[hintPositionKey(row, column)]) {
+        const key = hintPositionKey(row, column)
+        if (!hintTiles[key] && !coveredHintKeys.has(key)) {
           cells.push({ row, column })
         }
       }
@@ -93,7 +320,8 @@ function getGridTraversalOrder(
   } else {
     for (let row = 0; row < height; row += 1) {
       for (let column = 0; column < width; column += 1) {
-        if (!hintTiles[hintPositionKey(row, column)]) {
+        const key = hintPositionKey(row, column)
+        if (!hintTiles[key] && !coveredHintKeys.has(key)) {
           cells.push({ row, column })
         }
       }
@@ -109,6 +337,8 @@ const GridCell = memo(function GridCell({
   value,
   tabIndex,
   hintToolActive,
+  rangeSelected,
+  onPointerDown,
   onChange,
   onKeyDown,
   onHintClick,
@@ -116,7 +346,7 @@ const GridCell = memo(function GridCell({
   return (
     <input
       id={`cell-${row}-${column}`}
-      className={`grid-cell${hintToolActive ? ' grid-cell--hint-ready' : ''}`}
+      className={`grid-cell${hintToolActive ? ' grid-cell--hint-ready' : ''}${rangeSelected ? ' grid-cell--range-selected' : ''}`}
       type="text"
       inputMode="text"
       autoComplete="off"
@@ -124,6 +354,16 @@ const GridCell = memo(function GridCell({
       tabIndex={tabIndex}
       aria-label={`Row ${row + 1}, column ${column + 1}`}
       value={value === '.' ? '' : value}
+      data-grid-row={row}
+      data-grid-column={column}
+      data-row-span="1"
+      data-column-span="1"
+      style={{ gridRow: row + 1, gridColumn: column + 1 }}
+      onPointerDown={(event) => {
+        if (hintToolActive && event.button === 0) {
+          onPointerDown(row, column, event.pointerId)
+        }
+      }}
       onClick={(event) => {
         if (hintToolActive) {
           onHintClick(row, column, value)
@@ -143,18 +383,36 @@ const HintTileCell = memo(function HintTileCell({
   row,
   column,
   tile,
-  enabled,
+  hintToolActive,
+  rangeSelected,
+  onPointerDown,
   onClick,
 }: HintTileCellProps) {
-  const label = `${tile.direction === 'across' ? 'Across' : 'Down'} hint at row ${row + 1}, column ${column + 1}`
+  const isSpanned = tile.rowSpan > 1 || tile.columnSpan > 1
+  const label = `${tile.direction === 'across' ? 'Across' : 'Down'} hint at row ${row + 1}, column ${column + 1}${isSpanned ? `, ${tile.rowSpan} by ${tile.columnSpan} boxes` : ''}`
+  const spanStyle = {
+    gridRow: `${row + 1} / span ${tile.rowSpan}`,
+    gridColumn: `${column + 1} / span ${tile.columnSpan}`,
+  }
 
   return (
     <button
-      className={`hint-cell${tile.imageId ? ' hint-cell--filled' : ''}`}
+      className={`hint-cell${tile.imageId ? ' hint-cell--filled' : ''}${isSpanned ? ' hint-cell--spanned' : ''}${hintToolActive ? ' hint-cell--hint-tool-active' : ''}${rangeSelected ? ' hint-cell--range-selected' : ''}`}
       type="button"
       aria-label={label}
-      title={enabled ? `${label}: add or edit` : 'Select the hint tool to add or edit this clue'}
-      disabled={!enabled}
+      title={hintToolActive
+        ? `${label}: drag across grid squares to create a rectangular hint`
+        : `${label}: add or edit`}
+      data-grid-row={row}
+      data-grid-column={column}
+      data-row-span={tile.rowSpan}
+      data-column-span={tile.columnSpan}
+      style={spanStyle}
+      onPointerDown={(event) => {
+        if (hintToolActive && event.button === 0) {
+          onPointerDown(row, column, event.pointerId)
+        }
+      }}
       onClick={onClick}
     >
       {tile.imageId
@@ -170,13 +428,19 @@ function App() {
   const [pendingWidth, setPendingWidth] = useState('10')
   const [pendingHeight, setPendingHeight] = useState('10')
   const [title, setTitle] = useState('Untitled crossword')
+  const [puzzles, setPuzzles] = useState<SavedPuzzle[]>([])
+  const [selectedPuzzleId, setSelectedPuzzleId] = useState<string | null>(null)
   const [cells, setCells] = useState(() => createBlankGrid(MAX_DIMENSION, MAX_DIMENSION))
   const [hintTiles, setHintTiles] = useState<Record<string, HintTile>>(
     () => createDefaultHintTiles(10, 10),
   )
+  const [isDirty, setIsDirty] = useState(false)
+  const [isLoadingPuzzle, setIsLoadingPuzzle] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
   const [tabDirection, setTabDirection] = useState<'right' | 'down'>('right')
   const [isHintToolActive, setIsHintToolActive] = useState(false)
   const [activeHint, setActiveHint] = useState<ActiveHint | null>(null)
+  const [hintDragSelection, setHintDragSelection] = useState<HintDragSelection | null>(null)
   const [apiHealth, setApiHealth] = useState<ApiHealth | null>(null)
   const [apiError, setApiError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -184,6 +448,108 @@ function App() {
   const [isSaving, setIsSaving] = useState(false)
   const tabDirectionButtonRef = useRef<HTMLButtonElement>(null)
   const saveCrosswordButtonRef = useRef<HTMLButtonElement>(null)
+  const hintDragSelectionRef = useRef<HintDragSelection | null>(null)
+  const suppressHintClickRef = useRef(false)
+  const coveredHintPositionKeys = useMemo(
+    () => getCoveredHintPositionKeys(hintTiles),
+    [hintTiles],
+  )
+  const hintDragRectangle = useMemo(
+    () => getHintSelectionRectangle(hintDragSelection, hintTiles, width, height),
+    [height, hintDragSelection, hintTiles, width],
+  )
+  const selectedHintTileKeys = useMemo(
+    () => getHintSelectionTileKeys(hintDragRectangle, hintTiles),
+    [hintDragRectangle, hintTiles],
+  )
+
+  function updateHintDragSelection(selection: HintDragSelection | null) {
+    hintDragSelectionRef.current = selection
+    setHintDragSelection(selection)
+  }
+
+  useEffect(() => {
+    if (!hintDragSelection) {
+      return
+    }
+
+    function handlePointerMove(event: globalThis.PointerEvent) {
+      const current = hintDragSelectionRef.current
+      if (!current || current.pointerId !== event.pointerId) {
+        return
+      }
+
+      const position = getHintTilePositionFromPointerEvent(event)
+      if (!position) {
+        return
+      }
+
+      if (position.row !== current.end.row || position.column !== current.end.column) {
+        updateHintDragSelection({ ...current, end: position })
+      }
+    }
+
+    function handlePointerUp(event: globalThis.PointerEvent) {
+      const current = hintDragSelectionRef.current
+      if (!current || current.pointerId !== event.pointerId) {
+        return
+      }
+
+      const pointerPosition = getHintTilePositionFromPointerEvent(event)
+      const end = pointerPosition ?? current.end
+      const moved = end.row !== current.start.row || end.column !== current.start.column
+      updateHintDragSelection(null)
+      if (!moved) {
+        return
+      }
+
+      suppressHintClickRef.current = true
+      window.setTimeout(() => {
+        suppressHintClickRef.current = false
+      }, 0)
+      if (!isHintToolActive) {
+        return
+      }
+
+      const rectangle = getHintSelectionRectangle(
+        { ...current, end },
+        hintTiles,
+        width,
+        height,
+      )
+      if (!rectangle) {
+        setError('The selected hint area must stay within the grid.')
+        return
+      }
+
+      if (changeHintArea(rectangle.row, rectangle.column, rectangle.rowSpan, rectangle.columnSpan)) {
+        const key = hintPositionKey(rectangle.row, rectangle.column)
+        const tile = hintTiles[key]
+        setActiveHint({
+          row: rectangle.row,
+          column: rectangle.column,
+          direction: tile?.direction
+            ?? (rectangle.row === 0 && rectangle.column > 0 ? 'down' : 'across'),
+        })
+      }
+    }
+
+    function handlePointerCancel(event: globalThis.PointerEvent) {
+      const current = hintDragSelectionRef.current
+      if (current?.pointerId === event.pointerId) {
+        updateHintDragSelection(null)
+      }
+    }
+
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handlePointerUp)
+    window.addEventListener('pointercancel', handlePointerCancel)
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handlePointerUp)
+      window.removeEventListener('pointercancel', handlePointerCancel)
+    }
+  }, [hintDragSelection, hintTiles, height, isHintToolActive, width])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -211,6 +577,38 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const controller = new AbortController()
+
+    async function loadPuzzles() {
+      try {
+        const response = await fetch('/api/puzzles', { signal: controller.signal })
+        if (!response.ok) {
+          throw new Error(`Unable to load saved puzzles (${response.status})`)
+        }
+
+        const result: unknown = await response.json()
+        if (!Array.isArray(result) || !result.every(isSavedPuzzle)) {
+          throw new Error('The server returned an invalid puzzle list.')
+        }
+
+        setPuzzles((current) => [
+          ...current,
+          ...result.filter((puzzle) => !current.some((item) => item.id === puzzle.id)),
+        ])
+      } catch (requestError) {
+        if (controller.signal.aborted) {
+          return
+        }
+
+        setError(requestError instanceof Error ? requestError.message : 'Unable to load saved puzzles.')
+      }
+    }
+
+    void loadPuzzles()
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
     function handleShortcut(event: globalThis.KeyboardEvent) {
       if (event.key === 'Escape') {
         if (document.querySelector('.hint-editor')) {
@@ -218,7 +616,6 @@ function App() {
         }
 
         setActiveHint(null)
-        setIsHintToolActive(false)
         return
       }
 
@@ -282,6 +679,7 @@ function App() {
       return `${currentRow.slice(0, column)}${letter}${currentRow.slice(column + 1)}`
     }))
     setSavedPuzzle(null)
+    setIsDirty(true)
     setError(null)
 
     if (value) {
@@ -329,7 +727,8 @@ function App() {
       let nextRow = row + direction[0]
       let nextColumn = column + direction[1]
       while (nextRow >= 0 && nextRow < height && nextColumn >= 0 && nextColumn < width) {
-        if (!hintTiles[hintPositionKey(nextRow, nextColumn)]) {
+        const key = hintPositionKey(nextRow, nextColumn)
+        if (!hintTiles[key] && !coveredHintPositionKeys.has(key)) {
           event.preventDefault()
           focusCell(nextRow, nextColumn)
           break
@@ -347,7 +746,7 @@ function App() {
         focusCell(previousCell.row, previousCell.column)
       }
     }
-  }, [focusCell, height, hintTiles, isHintToolActive, tabDirection, width])
+  }, [coveredHintPositionKeys, focusCell, height, hintTiles, isHintToolActive, tabDirection, width])
 
   const verticalTabOrder = tabDirection === 'down' && !isHintToolActive
     ? getGridTraversalOrder(width, height, hintTiles, 'down')
@@ -355,6 +754,16 @@ function App() {
   const verticalTabFirstCellKey = verticalTabOrder.length > 0
     ? hintPositionKey(verticalTabOrder[0].row, verticalTabOrder[0].column)
     : null
+  const printCellSize = Math.min(8, 176 / Math.max(width, height))
+  const activeHintTile = activeHint
+    ? hintTiles[hintPositionKey(activeHint.row, activeHint.column)]
+    : undefined
+  const activeHintRowOptions = activeHintTile
+    ? getHintDimensionOptions(activeHintTile, hintTiles, width, height, 'rows')
+    : undefined
+  const activeHintColumnOptions = activeHintTile
+    ? getHintDimensionOptions(activeHintTile, hintTiles, width, height, 'columns')
+    : undefined
 
   function handleWidthChange(value: string) {
     setPendingWidth(value)
@@ -394,9 +803,12 @@ function App() {
         cell !== '.' && (rowIndex >= nextHeight || columnIndex >= nextWidth)
       ))
     ))
-    const removesHints = Object.values(hintTiles).some(
-      ({ row, column }) => row >= nextHeight || column >= nextWidth,
-    )
+    const removesHints = Object.values(hintTiles).some((tile) => {
+      return tile.row >= nextHeight
+        || tile.column >= nextWidth
+        || tile.row + tile.rowSpan > nextHeight
+        || tile.column + tile.columnSpan > nextWidth
+    })
     if (
       (removesLetters || removesHints)
       && !window.confirm('Resizing will remove letters or hints outside the new grid and may cut words. Continue?')
@@ -419,13 +831,18 @@ function App() {
       const nextTiles: Record<string, HintTile> = {}
       for (const [key, tile] of Object.entries(current)) {
         if (tile.row < nextHeight && tile.column < nextWidth) {
-          nextTiles[key] = tile
+          nextTiles[key] = {
+            ...tile,
+            rowSpan: Math.min(tile.rowSpan, nextHeight - tile.row),
+            columnSpan: Math.min(tile.columnSpan, nextWidth - tile.column),
+          }
         }
       }
 
+      const coveredPositions = getCoveredHintPositionKeys(nextTiles)
       for (const [key, tile] of Object.entries(createDefaultHintTiles(nextWidth, nextHeight))) {
         const newlyAddedEdge = tile.row >= height || tile.column >= width
-        if (newlyAddedEdge && !nextTiles[key]) {
+        if (newlyAddedEdge && !nextTiles[key] && !coveredPositions.has(key)) {
           nextTiles[key] = tile
         }
       }
@@ -436,7 +853,158 @@ function App() {
     setWidth(nextWidth)
     setHeight(nextHeight)
     setSavedPuzzle(null)
+    setIsDirty(true)
     setError(null)
+  }
+
+  function startNewPuzzle() {
+    setWidth(10)
+    setHeight(10)
+    setPendingWidth('10')
+    setPendingHeight('10')
+    setTitle('Untitled crossword')
+    setCells(createBlankGrid(MAX_DIMENSION, MAX_DIMENSION))
+    setHintTiles(createDefaultHintTiles(10, 10))
+    setSelectedPuzzleId(null)
+    setSavedPuzzle(null)
+    setActiveHint(null)
+    updateHintDragSelection(null)
+    setIsHintToolActive(false)
+    setIsDirty(false)
+    setError(null)
+  }
+
+  async function handlePuzzleSelectionChange(puzzleId: string) {
+    const nextPuzzleId = puzzleId || null
+    if (nextPuzzleId === selectedPuzzleId) {
+      return
+    }
+
+    if (
+      isDirty
+      && !window.confirm('Discard unsaved crossword changes and switch puzzles?')
+    ) {
+      return
+    }
+
+    if (nextPuzzleId === null) {
+      startNewPuzzle()
+      return
+    }
+
+    setIsLoadingPuzzle(true)
+    setError(null)
+    try {
+      const response = await fetch(`/api/puzzles/${nextPuzzleId}`)
+      if (!response.ok) {
+        throw new Error(`Unable to load crossword (${response.status})`)
+      }
+
+      const result = await response.json() as PuzzleResponse
+      const content = result.content
+      if (
+        result.id !== nextPuzzleId
+        || !result.title
+        || !content
+        || !Number.isInteger(content.width)
+        || content.width < 1
+        || content.width > MAX_DIMENSION
+        || !Number.isInteger(content.height)
+        || content.height < 1
+        || content.height > MAX_DIMENSION
+        || !Array.isArray(content.cells)
+        || content.cells.length !== content.height
+        || (content.hints !== undefined && !Array.isArray(content.hints))
+      ) {
+        throw new Error('The server returned invalid crossword data.')
+      }
+
+      const loadedCells = createBlankGrid(MAX_DIMENSION, MAX_DIMENSION)
+      for (let rowIndex = 0; rowIndex < content.height; rowIndex += 1) {
+        const row = content.cells[rowIndex]
+        if (typeof row !== 'string' || row.length !== content.width) {
+          throw new Error('The server returned invalid crossword grid data.')
+        }
+
+        loadedCells[rowIndex] = `${row}${'.'.repeat(MAX_DIMENSION - content.width)}`
+      }
+
+      const loadedHintTiles: Record<string, HintTile> = {}
+      const occupiedHintPositions = new Set<string>()
+      for (const tile of content.hints ?? []) {
+        const hasDimensionFields = tile.rowSpan !== undefined || tile.columnSpan !== undefined
+        const legacySpan = tile.span ?? 1
+        const rowSpan = tile.rowSpan
+          ?? (!hasDimensionFields && tile.column === 0 ? legacySpan : 1)
+        const columnSpan = tile.columnSpan
+          ?? (!hasDimensionFields && tile.row === 0 && tile.column > 0 ? legacySpan : 1)
+        if (
+          !Number.isInteger(tile.row)
+          || tile.row < 0
+          || tile.row >= content.height
+          || !Number.isInteger(tile.column)
+          || tile.column < 0
+          || tile.column >= content.width
+          || (tile.direction !== 'across' && tile.direction !== 'down')
+          || !Number.isInteger(rowSpan)
+          || rowSpan < 1
+          || tile.row + rowSpan > content.height
+          || !Number.isInteger(columnSpan)
+          || columnSpan < 1
+          || tile.column + columnSpan > content.width
+          || !Number.isInteger(legacySpan)
+          || legacySpan < 1
+          || (legacySpan > 1
+            && !hasDimensionFields
+            && tile.row !== 0
+            && tile.column !== 0)
+        ) {
+          throw new Error('The server returned invalid crossword hint data.')
+        }
+
+        for (let rowOffset = 0; rowOffset < rowSpan; rowOffset += 1) {
+          for (let columnOffset = 0; columnOffset < columnSpan; columnOffset += 1) {
+            const position = { row: tile.row + rowOffset, column: tile.column + columnOffset }
+            const positionKey = hintPositionKey(position.row, position.column)
+            if (
+              content.cells[position.row][position.column] !== '.'
+              || occupiedHintPositions.has(positionKey)
+            ) {
+              throw new Error('The server returned overlapping crossword hint data.')
+            }
+
+            occupiedHintPositions.add(positionKey)
+          }
+        }
+
+        loadedHintTiles[hintPositionKey(tile.row, tile.column)] = {
+          row: tile.row,
+          column: tile.column,
+          direction: tile.direction,
+          imageId: tile.imageId,
+          rowSpan,
+          columnSpan,
+        }
+      }
+
+      setWidth(content.width)
+      setHeight(content.height)
+      setPendingWidth(String(content.width))
+      setPendingHeight(String(content.height))
+      setTitle(result.title)
+      setCells(loadedCells)
+      setHintTiles(loadedHintTiles)
+      setSelectedPuzzleId(result.id)
+      setSavedPuzzle(null)
+      setActiveHint(null)
+      updateHintDragSelection(null)
+      setIsHintToolActive(false)
+      setIsDirty(false)
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Unable to load crossword.')
+    } finally {
+      setIsLoadingPuzzle(false)
+    }
   }
 
   async function saveCrossword() {
@@ -469,17 +1037,20 @@ function App() {
     setError(null)
 
     try {
-      const response = await fetch('/api/puzzles', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: normalizedTitle,
-          width,
-          height,
-          cells: cells.slice(0, height).map((row) => row.slice(0, width)),
-          hints: Object.values(hintTiles),
-        }),
-      })
+      const response = await fetch(
+        selectedPuzzleId ? `/api/puzzles/${selectedPuzzleId}` : '/api/puzzles',
+        {
+          method: selectedPuzzleId ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: normalizedTitle,
+            width,
+            height,
+            cells: cells.slice(0, height).map((row) => row.slice(0, width)),
+            hints: Object.values(hintTiles),
+          }),
+        },
+      )
       const result = await response.json() as {
         id?: string
         title?: string
@@ -496,12 +1067,54 @@ function App() {
         throw new Error('The server returned an invalid save confirmation.')
       }
 
-      setSavedPuzzle({ id: result.id, title: result.title })
+      const savedResult = { id: result.id, title: result.title }
+      setSavedPuzzle(savedResult)
+      setSelectedPuzzleId(savedResult.id)
+      setIsDirty(false)
+      setPuzzles((current) => [
+        savedResult,
+        ...current.filter((puzzle) => puzzle.id !== savedResult.id),
+      ])
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save the crossword.')
       setSavedPuzzle(null)
     } finally {
       setIsSaving(false)
+    }
+  }
+
+  async function deleteSelectedPuzzle() {
+    if (!selectedPuzzleId || isDeleting) {
+      return
+    }
+
+    const selectedPuzzle = puzzles.find((puzzle) => puzzle.id === selectedPuzzleId)
+    const puzzleTitle = selectedPuzzle?.title ?? title
+    const unsavedChangesMessage = isDirty ? ' Any unsaved changes will also be lost.' : ''
+    if (!window.confirm(
+      `Delete "${puzzleTitle}"? This cannot be undone.${unsavedChangesMessage}`,
+    )) {
+      return
+    }
+
+    setIsDeleting(true)
+    setError(null)
+    try {
+      const response = await fetch(`/api/puzzles/${selectedPuzzleId}`, { method: 'DELETE' })
+      if (!response.ok) {
+        throw new Error(
+          response.status === 404
+            ? 'The selected crossword no longer exists.'
+            : `Delete failed (${response.status}).`,
+        )
+      }
+
+      setPuzzles((current) => current.filter((puzzle) => puzzle.id !== selectedPuzzleId))
+      startNewPuzzle()
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Unable to delete the crossword.')
+    } finally {
+      setIsDeleting(false)
     }
   }
 
@@ -528,15 +1141,38 @@ function App() {
     return result.id
   }
 
+  function handleHintPointerDown(row: number, column: number, pointerId: number) {
+    if (!isHintToolActive) {
+      return
+    }
+
+    const position = { row, column }
+    updateHintDragSelection({
+      start: position,
+      end: position,
+      pointerId,
+    })
+  }
+
+  function handleExistingHintClick(row: number, column: number, direction: ActiveHint['direction']) {
+    if (suppressHintClickRef.current) {
+      suppressHintClickRef.current = false
+      return
+    }
+
+    setActiveHint({ row, column, direction })
+  }
+
   function handleHintTileClick(row: number, column: number, value: string) {
+    if (suppressHintClickRef.current) {
+      suppressHintClickRef.current = false
+      return
+    }
+
     const key = hintPositionKey(row, column)
     const existingTile = hintTiles[key]
     if (existingTile) {
-      setActiveHint({
-        row,
-        column,
-        direction: existingTile.direction,
-      })
+      handleExistingHintClick(row, column, existingTile.direction)
       return
     }
 
@@ -559,28 +1195,137 @@ function App() {
         column,
         direction: 'across',
         imageId: null,
+        rowSpan: 1,
+        columnSpan: 1,
       },
     }))
     setSavedPuzzle(null)
+    setIsDirty(true)
     setError(null)
     setActiveHint({ row, column, direction: 'across' })
   }
 
-  function handleHintDirectionChange(direction: ActiveHint['direction']) {
-    if (!activeHint) {
-      return
+  function changeHintArea(row: number, column: number, rowSpan: number, columnSpan: number) {
+    const key = hintPositionKey(row, column)
+    const tile = hintTiles[key]
+    const rectangle = { row, column, rowSpan, columnSpan }
+    if (
+      !Number.isInteger(rowSpan)
+      || !Number.isInteger(columnSpan)
+      || rowSpan < 1
+      || columnSpan < 1
+      || row + rowSpan > height
+      || column + columnSpan > width
+    ) {
+      return false
     }
 
-    const key = hintPositionKey(activeHint.row, activeHint.column)
+    const overlappingTiles = Object.values(hintTiles).filter((candidate) => (
+      hintRectanglesOverlap(rectangle, getHintRectangle(candidate))
+    ))
+    if (overlappingTiles.some((candidate) => {
+      const candidateRectangle = getHintRectangle(candidate)
+      const isAnchor = candidate.row === row && candidate.column === column
+      return !hintRectangleContains(rectangle, candidateRectangle)
+        && !(isAnchor && hintRectangleContains(candidateRectangle, rectangle))
+    })) {
+      setError('The selected hint area cannot split another combined hint.')
+      return false
+    }
+
+    if (
+      tile
+      && tile.rowSpan === rowSpan
+      && tile.columnSpan === columnSpan
+      && overlappingTiles.length === 1
+    ) {
+      return true
+    }
+
+    let erasedLetterCount = 0
+    for (let selectedRow = row; selectedRow < row + rowSpan; selectedRow += 1) {
+      for (let selectedColumn = column; selectedColumn < column + columnSpan; selectedColumn += 1) {
+        if (cells[selectedRow][selectedColumn] !== '.') {
+          erasedLetterCount += 1
+        }
+      }
+    }
+
+    const imageTiles = overlappingTiles.filter((candidate) => candidate.imageId)
+    const retainedImageId = tile?.imageId ?? imageTiles[0]?.imageId ?? null
+    const removedImageCount = imageTiles.length - (retainedImageId ? 1 : 0)
+    const confirmationParts: string[] = []
+    if (erasedLetterCount > 0) {
+      confirmationParts.push(`${erasedLetterCount} letter${erasedLetterCount === 1 ? '' : 's'} will be erased`)
+    }
+    if (removedImageCount > 0) {
+      confirmationParts.push(`saved images from ${removedImageCount} hint${removedImageCount === 1 ? '' : 's'} will be removed`)
+    }
+    if (
+      confirmationParts.length > 0
+      && !window.confirm(`This rectangular hint will replace the selected content: ${confirmationParts.join('; ')}. Continue?`)
+    ) {
+      return false
+    }
+
     setHintTiles((current) => {
-      const tile = current[key]
-      return tile ? { ...current, [key]: { ...tile, direction } } : current
+      const updated = { ...current }
+      for (const existingTile of overlappingTiles) {
+        delete updated[hintPositionKey(existingTile.row, existingTile.column)]
+        for (let rowOffset = 0; rowOffset < existingTile.rowSpan; rowOffset += 1) {
+          for (let columnOffset = 0; columnOffset < existingTile.columnSpan; columnOffset += 1) {
+            const restoredRow = existingTile.row + rowOffset
+            const restoredColumn = existingTile.column + columnOffset
+            if (
+              restoredRow >= row
+              && restoredRow < row + rowSpan
+              && restoredColumn >= column
+              && restoredColumn < column + columnSpan
+            ) {
+              continue
+            }
+
+            updated[hintPositionKey(restoredRow, restoredColumn)] = {
+              row: restoredRow,
+              column: restoredColumn,
+              direction: existingTile.direction,
+              imageId: null,
+              rowSpan: 1,
+              columnSpan: 1,
+            }
+          }
+        }
+      }
+
+      updated[key] = {
+        row,
+        column,
+        direction: tile?.direction ?? (row === 0 && column > 0 ? 'down' : 'across'),
+        imageId: retainedImageId,
+        rowSpan,
+        columnSpan,
+      }
+      return updated
     })
-    setActiveHint((current) => (current ? { ...current, direction } : current))
+    setCells((current) => current.map((currentRow, rowIndex) => (
+      rowIndex >= row && rowIndex < row + rowSpan
+        ? `${currentRow.slice(0, column)}${'.'.repeat(columnSpan)}${currentRow.slice(column + columnSpan)}`
+        : currentRow
+    )))
+
     setSavedPuzzle(null)
+    setIsDirty(true)
+    setError(null)
+    return true
   }
 
-  function handleHintSaved(imageId: string) {
+  function handleHintDimensionsChange(rowSpan: number, columnSpan: number) {
+    if (activeHint) {
+      changeHintArea(activeHint.row, activeHint.column, rowSpan, columnSpan)
+    }
+  }
+
+  function handleHintSaved(imageId: string | null) {
     if (!activeHint) {
       return
     }
@@ -591,6 +1336,7 @@ function App() {
       return tile ? { ...current, [key]: { ...tile, imageId } } : current
     })
     setSavedPuzzle(null)
+    setIsDirty(true)
     setError(null)
     setActiveHint(null)
   }
@@ -602,19 +1348,37 @@ function App() {
 
     const key = hintPositionKey(activeHint.row, activeHint.column)
     const tile = hintTiles[key]
+    if (!tile) {
+      return
+    }
+
     if (
       tile?.imageId
-      && !window.confirm('This hint already has an image saved. Remove the hint from this grid?')
+      && !window.confirm(
+        tile.rowSpan > 1 || tile.columnSpan > 1
+          ? 'This hint has a saved image. Remove it and restore all covered squares as letter boxes?'
+          : 'This hint already has an image saved. Remove the hint from this grid?',
+      )
     ) {
       return
     }
 
     setHintTiles((current) => {
       const updated = { ...current }
-      delete updated[key]
+      for (let rowOffset = 0; rowOffset < tile.rowSpan; rowOffset += 1) {
+        for (let columnOffset = 0; columnOffset < tile.columnSpan; columnOffset += 1) {
+          delete updated[hintPositionKey(tile.row + rowOffset, tile.column + columnOffset)]
+        }
+      }
       return updated
     })
+    setCells((current) => current.map((row, rowIndex) => (
+      rowIndex >= tile.row && rowIndex < tile.row + tile.rowSpan
+        ? `${row.slice(0, tile.column)}${'.'.repeat(tile.columnSpan)}${row.slice(tile.column + tile.columnSpan)}`
+        : row
+    )))
     setSavedPuzzle(null)
+    setIsDirty(true)
     setActiveHint(null)
   }
 
@@ -642,8 +1406,8 @@ function App() {
         <section className="editor-card" aria-labelledby="editor-title">
           <div className="editor-heading">
             <div>
-              <p className="eyebrow">New puzzle</p>
-              <h2 id="editor-title">Build your grid</h2>
+              <p className="eyebrow">{selectedPuzzleId ? 'Editing saved puzzle' : 'New puzzle'}</p>
+              <h2 id="editor-title">{selectedPuzzleId ? 'Edit your grid' : 'Build your grid'}</h2>
             </div>
             <p className="editor-hint">
               Use the hint tool on any square to replace it with an across or down clue tile. Resizing warns before removing content.
@@ -651,6 +1415,20 @@ function App() {
           </div>
 
           <div className="editor-controls">
+            <label className="puzzle-picker" htmlFor="puzzle-picker">
+              <span>Choose puzzle</span>
+              <select
+                id="puzzle-picker"
+                value={selectedPuzzleId ?? ''}
+                disabled={isLoadingPuzzle || isSaving || isDeleting}
+                onChange={(event) => void handlePuzzleSelectionChange(event.currentTarget.value)}
+              >
+                <option value="">New crossword</option>
+                {puzzles.map((puzzle) => (
+                  <option key={puzzle.id} value={puzzle.id}>{puzzle.title}</option>
+                ))}
+              </select>
+            </label>
             <label className="title-field" htmlFor="puzzle-title">
               <span>Crossword title</span>
               <input
@@ -661,6 +1439,7 @@ function App() {
                 onChange={(event) => {
                   setTitle(event.currentTarget.value)
                   setSavedPuzzle(null)
+                  setIsDirty(true)
                   setError(null)
                 }}
               />
@@ -720,56 +1499,78 @@ function App() {
               title="Press U outside editable fields, or Alt+U in a grid cell, to switch Tab direction"
               onClick={() => setTabDirection((current) => (current === 'right' ? 'down' : 'right'))}
             >
-              Tab: {tabDirection === 'right' ? 'Right' : 'Down'} <kbd>U</kbd>
+              Move: {tabDirection === 'right' ? 'Right' : 'Down'} <kbd>U</kbd>
             </button>
-            <span>The left column starts with Across hints; the top row starts with Down hints. Use the hint tool to edit them or add a hint anywhere. Press Esc to return to letters. Use Alt+H/Alt+U in a grid square so H/U remain available as letters.</span>
+            <span>The left column starts with Across hints; the top row starts with Down hints. Click a square with the hint tool to create one hint, or drag across any rectangular area to create a combined hint. Click an existing hint to edit it. Press Esc to return to letters. Use Alt+H/Alt+U in a grid square so H/U remain available as letters.</span>
           </div>
 
-          <div className="grid-viewport" aria-label="Crossword grid">
-            <div
-              className="letter-grid"
-              style={{ gridTemplateColumns: `repeat(${width}, 34px)` }}
-            >
-              {cells.slice(0, height).flatMap((row, rowIndex) => (
-                Array.from(row.slice(0, width), (value, columnIndex) => {
-                  const key = hintPositionKey(rowIndex, columnIndex)
-                  const tile = hintTiles[key]
-                  if (tile) {
+          <div className="grid-container" aria-busy={isLoadingPuzzle}>
+            <div className="grid-viewport" aria-label="Crossword grid">
+              <div
+                className="letter-grid"
+                style={{ gridTemplateColumns: `repeat(${width}, 34px)` }}
+              >
+                {cells.slice(0, height).flatMap((row, rowIndex) => (
+                  Array.from(row.slice(0, width), (value, columnIndex) => {
+                    const key = hintPositionKey(rowIndex, columnIndex)
+                    if (coveredHintPositionKeys.has(key)) {
+                      return null
+                    }
+
+                    const tile = hintTiles[key]
+                    if (tile) {
+                      return (
+                        <HintTileCell
+                          key={key}
+                          row={rowIndex}
+                          column={columnIndex}
+                          tile={tile}
+                          hintToolActive={isHintToolActive}
+                          rangeSelected={selectedHintTileKeys.has(key)}
+                          onPointerDown={handleHintPointerDown}
+                          onClick={() => handleExistingHintClick(
+                            rowIndex,
+                            columnIndex,
+                            tile.direction,
+                          )}
+                        />
+                      )
+                    }
+
                     return (
-                      <HintTileCell
+                      <GridCell
                         key={key}
                         row={rowIndex}
                         column={columnIndex}
-                        tile={tile}
-                        enabled={isHintToolActive}
-                        onClick={() => setActiveHint({
-                          row: rowIndex,
-                          column: columnIndex,
-                          direction: tile.direction,
-                        })}
+                        value={value}
+                        tabIndex={verticalTabOrder.length === 0
+                          || key === verticalTabFirstCellKey
+                          ? 0
+                          : -1}
+                        hintToolActive={isHintToolActive}
+                        rangeSelected={Boolean(
+                          hintDragRectangle
+                          && rowIndex >= hintDragRectangle.row
+                          && rowIndex < hintDragRectangle.row + hintDragRectangle.rowSpan
+                          && columnIndex >= hintDragRectangle.column
+                          && columnIndex < hintDragRectangle.column + hintDragRectangle.columnSpan,
+                        )}
+                        onPointerDown={handleHintPointerDown}
+                        onChange={handleCellChange}
+                        onKeyDown={handleCellKeyDown}
+                        onHintClick={handleHintTileClick}
                       />
                     )
-                  }
-
-                  return (
-                    <GridCell
-                      key={key}
-                      row={rowIndex}
-                      column={columnIndex}
-                      value={value}
-                      tabIndex={verticalTabOrder.length === 0
-                        || key === verticalTabFirstCellKey
-                        ? 0
-                        : -1}
-                      hintToolActive={isHintToolActive}
-                      onChange={handleCellChange}
-                      onKeyDown={handleCellKeyDown}
-                      onHintClick={handleHintTileClick}
-                    />
-                  )
-                })
-              ))}
+                  })
+                ))}
+              </div>
             </div>
+            {isLoadingPuzzle && (
+              <div className="grid-loading-overlay" role="status" aria-live="polite">
+                <span className="grid-loading-spinner" aria-hidden="true" />
+                <span>Loading crossword…</span>
+              </div>
+            )}
           </div>
 
           <div className="editor-footer">
@@ -781,26 +1582,94 @@ function App() {
                 </p>
               )}
             </div>
-            <button
-              ref={saveCrosswordButtonRef}
-              className="primary-button"
-              type="button"
-              disabled={isSaving}
-              onClick={() => void saveCrossword()}
-            >
-              {isSaving ? 'Saving…' : 'Save crossword'}
-            </button>
+            <div className="editor-actions">
+              <button
+                className="secondary-button print-button"
+                type="button"
+                onClick={() => window.print()}
+              >
+                Print crossword
+              </button>
+              <button
+                className="secondary-button delete-button"
+                type="button"
+                disabled={!selectedPuzzleId || isLoadingPuzzle || isSaving || isDeleting}
+                onClick={() => void deleteSelectedPuzzle()}
+              >
+                {isDeleting ? 'Deleting…' : 'Delete crossword'}
+              </button>
+              <button
+                ref={saveCrosswordButtonRef}
+                className="primary-button"
+                type="button"
+                disabled={isSaving || isLoadingPuzzle || isDeleting}
+                onClick={() => void saveCrossword()}
+              >
+                {isSaving
+                  ? 'Saving…'
+                  : selectedPuzzleId
+                    ? 'Save changes'
+                    : 'Save crossword'}
+              </button>
+            </div>
           </div>
         </section>
       </div>
+      <section className="print-preview" aria-hidden="true">
+        <h1>{title.trim() || 'Untitled crossword'}</h1>
+        <table
+          className="print-grid"
+          style={{ width: `${width * printCellSize}mm` }}
+        >
+          <tbody>
+            {cells.slice(0, height).map((row, rowIndex) => (
+              <tr key={rowIndex}>
+                {Array.from(row.slice(0, width), (value, columnIndex) => {
+                  const key = hintPositionKey(rowIndex, columnIndex)
+                  if (coveredHintPositionKeys.has(key)) {
+                    return null
+                  }
+
+                  const tile = hintTiles[key]
+                  const style = { height: `${printCellSize}mm` }
+
+                  if (tile) {
+                    return (
+                      <td
+                        className="print-cell print-cell--hint"
+                        key={key}
+                        rowSpan={tile.rowSpan > 1 ? tile.rowSpan : undefined}
+                        colSpan={tile.columnSpan > 1 ? tile.columnSpan : undefined}
+                        style={style}
+                      >
+                        {tile.imageId && <img src={`/api/hint-images/${tile.imageId}`} alt="" />}
+                      </td>
+                    )
+                  }
+
+                  return (
+                    <td
+                      className={`print-cell${value === '.' ? ' print-cell--empty' : ' print-cell--letter'}`}
+                      key={key}
+                      style={style}
+                    />
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
       {activeHint && (
         <HintEditor
           title={`Hint · Row ${activeHint.row + 1}, Column ${activeHint.column + 1}`}
-          direction={activeHint.direction}
-          imageId={hintTiles[hintPositionKey(activeHint.row, activeHint.column)]?.imageId ?? undefined}
+          imageId={activeHintTile?.imageId ?? undefined}
+          rowSpan={activeHintTile?.rowSpan}
+          columnSpan={activeHintTile?.columnSpan}
+          rowSpanOptions={activeHintRowOptions}
+          columnSpanOptions={activeHintColumnOptions}
           onCancel={() => setActiveHint(null)}
-          onEscape={() => setIsHintToolActive(false)}
-          onDirectionChange={handleHintDirectionChange}
+          onDimensionsChange={handleHintDimensionsChange}
           onSave={uploadHintImage}
           onSaved={handleHintSaved}
           onRemove={removeActiveHint}

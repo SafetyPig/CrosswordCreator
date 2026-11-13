@@ -60,4 +60,12 @@ public static class HintImageStore
         contentType = string.Empty;
         return false;
     }
+
+    public static void DeleteImage(IWebHostEnvironment environment, Guid id)
+    {
+        if (TryGetImage(environment, id, out var filePath, out _))
+        {
+            File.Delete(filePath);
+        }
+    }
 }
