@@ -1,6 +1,9 @@
 # .NET
 **/bin/
 **/obj/
+**/App_Data/*.db
+**/App_Data/*.db-shm
+**/App_Data/*.db-wal
 
 # Node
 **/node_modules/
