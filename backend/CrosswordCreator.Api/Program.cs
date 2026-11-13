@@ -34,5 +34,6 @@ app.MapGet("/api/health", () => Results.Ok(new
 .WithName("GetHealth");
 
 app.MapPuzzleEndpoints();
+app.MapHintImageEndpoints();
 
 app.Run();

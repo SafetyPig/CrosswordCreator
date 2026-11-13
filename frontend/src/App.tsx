@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useState } from 'react'
 import type { KeyboardEvent } from 'react'
+import HintEditor from './HintEditor'
 
 const MAX_DIMENSION = 100
 
@@ -17,34 +18,118 @@ interface GridCellProps {
   row: number
   column: number
   value: string
+  hintToolActive: boolean
   onChange: (row: number, column: number, value: string) => void
   onKeyDown: (row: number, column: number, value: string, event: KeyboardEvent<HTMLInputElement>) => void
+  onHintClick: (row: number, column: number, value: string) => void
+}
+
+interface ActiveHint {
+  row: number
+  column: number
+  direction: 'across' | 'down'
+}
+
+interface HintTile extends ActiveHint {
+  imageId: string | null
+}
+
+interface HintTileCellProps {
+  row: number
+  column: number
+  tile: HintTile
+  enabled: boolean
+  onClick: () => void
 }
 
 function createBlankGrid(width: number, height: number) {
   return Array.from({ length: height }, () => '.'.repeat(width))
 }
 
+function createDefaultHintTiles(width: number, height: number) {
+  const tiles: Record<string, HintTile> = {}
+
+  for (let row = 0; row < height; row += 1) {
+    tiles[hintPositionKey(row, 0)] = {
+      row,
+      column: 0,
+      direction: 'across',
+      imageId: null,
+    }
+  }
+
+  for (let column = 1; column < width; column += 1) {
+    tiles[hintPositionKey(0, column)] = {
+      row: 0,
+      column,
+      direction: 'down',
+      imageId: null,
+    }
+  }
+
+  return tiles
+}
+
+function hintPositionKey(row: number, column: number) {
+  return `${row}:${column}`
+}
+
 const GridCell = memo(function GridCell({
   row,
   column,
   value,
+  hintToolActive,
   onChange,
   onKeyDown,
+  onHintClick,
 }: GridCellProps) {
   return (
     <input
       id={`cell-${row}-${column}`}
-      className="grid-cell"
+      className={`grid-cell${hintToolActive ? ' grid-cell--hint-ready' : ''}`}
       type="text"
       inputMode="text"
       autoComplete="off"
       maxLength={1}
       aria-label={`Row ${row + 1}, column ${column + 1}`}
       value={value === '.' ? '' : value}
+      onClick={(event) => {
+        if (hintToolActive) {
+          onHintClick(row, column, value)
+          return
+        }
+
+        const end = event.currentTarget.value.length
+        event.currentTarget.setSelectionRange(end, end)
+      }}
       onChange={(event) => onChange(row, column, event.currentTarget.value)}
       onKeyDown={(event) => onKeyDown(row, column, value, event)}
     />
+  )
+})
+
+const HintTileCell = memo(function HintTileCell({
+  row,
+  column,
+  tile,
+  enabled,
+  onClick,
+}: HintTileCellProps) {
+  const label = `${tile.direction === 'across' ? 'Across' : 'Down'} hint at row ${row + 1}, column ${column + 1}`
+
+  return (
+    <button
+      className={`hint-cell${tile.imageId ? ' hint-cell--filled' : ''}`}
+      type="button"
+      aria-label={label}
+      title={enabled ? `${label}: add or edit` : 'Select the hint tool to add or edit this clue'}
+      disabled={!enabled}
+      onClick={onClick}
+    >
+      {tile.imageId
+        ? <img src={`/api/hint-images/${tile.imageId}`} alt="" />
+        : <span aria-hidden="true">+</span>}
+    </button>
   )
 })
 
@@ -55,6 +140,11 @@ function App() {
   const [pendingHeight, setPendingHeight] = useState('10')
   const [title, setTitle] = useState('Untitled crossword')
   const [cells, setCells] = useState(() => createBlankGrid(MAX_DIMENSION, MAX_DIMENSION))
+  const [hintTiles, setHintTiles] = useState<Record<string, HintTile>>(
+    () => createDefaultHintTiles(10, 10),
+  )
+  const [isHintToolActive, setIsHintToolActive] = useState(false)
+  const [activeHint, setActiveHint] = useState<ActiveHint | null>(null)
   const [apiHealth, setApiHealth] = useState<ApiHealth | null>(null)
   const [apiError, setApiError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -86,14 +176,52 @@ function App() {
     return () => controller.abort()
   }, [])
 
+  useEffect(() => {
+    function handleShortcut(event: globalThis.KeyboardEvent) {
+      if (event.key === 'Escape') {
+        if (document.querySelector('.hint-editor')) {
+          return
+        }
+
+        setActiveHint(null)
+        setIsHintToolActive(false)
+        return
+      }
+
+      if (event.key.toLowerCase() !== 'h' || event.repeat) {
+        return
+      }
+
+      const target = event.target
+      if (
+        target instanceof HTMLElement
+        && (
+          target.closest('.hint-editor') !== null
+          || target.isContentEditable
+          || target instanceof HTMLTextAreaElement
+          || target instanceof HTMLSelectElement
+          || (target instanceof HTMLInputElement && !target.classList.contains('grid-cell'))
+        )
+      ) {
+        return
+      }
+
+      event.preventDefault()
+      setIsHintToolActive((current) => !current)
+    }
+
+    window.addEventListener('keydown', handleShortcut)
+    return () => window.removeEventListener('keydown', handleShortcut)
+  }, [])
+
   const focusCell = useCallback((row: number, column: number) => {
     requestAnimationFrame(() => document.getElementById(`cell-${row}-${column}`)?.focus())
   }, [])
 
   const handleCellChange = useCallback((row: number, column: number, rawValue: string) => {
     const value = rawValue.toUpperCase()
-    if (value !== '' && !/^[A-Z]$/.test(value)) {
-      setError('Enter one letter from A to Z per square.')
+    if (value !== '' && !/^[A-ZÅÄÖÆØÐÞ]$/.test(value)) {
+      setError('Enter one letter from A to Z or a Nordic letter (Å, Ä, Ö, Æ, Ø, Ð, Þ) per square.')
       return
     }
 
@@ -109,12 +237,22 @@ function App() {
     setError(null)
 
     if (value) {
-      const nextIndex = row * width + column + 1
-      if (nextIndex < width * height) {
-        focusCell(Math.floor(nextIndex / width), nextIndex % width)
+      let nextRow = row
+      let nextColumn = column + 1
+      while (nextRow < height) {
+        while (nextColumn < width) {
+          if (!hintTiles[hintPositionKey(nextRow, nextColumn)]) {
+            focusCell(nextRow, nextColumn)
+            return
+          }
+          nextColumn += 1
+        }
+
+        nextRow += 1
+        nextColumn = 0
       }
     }
-  }, [focusCell, height, width])
+  }, [focusCell, height, hintTiles, width])
 
   const handleCellKeyDown = useCallback((
     row: number,
@@ -131,17 +269,28 @@ function App() {
     const direction = movement[event.key]
 
     if (direction) {
-      const nextRow = row + direction[0]
-      const nextColumn = column + direction[1]
-      if (nextRow >= 0 && nextRow < height && nextColumn >= 0 && nextColumn < width) {
-        event.preventDefault()
-        focusCell(nextRow, nextColumn)
+      let nextRow = row + direction[0]
+      let nextColumn = column + direction[1]
+      while (nextRow >= 0 && nextRow < height && nextColumn >= 0 && nextColumn < width) {
+        if (!hintTiles[hintPositionKey(nextRow, nextColumn)]) {
+          event.preventDefault()
+          focusCell(nextRow, nextColumn)
+          break
+        }
+
+        nextRow += direction[0]
+        nextColumn += direction[1]
       }
     } else if (event.key === 'Backspace' && value === '.' && column > 0) {
-      event.preventDefault()
-      focusCell(row, column - 1)
+      for (let previousColumn = column - 1; previousColumn >= 0; previousColumn -= 1) {
+        if (!hintTiles[hintPositionKey(row, previousColumn)]) {
+          event.preventDefault()
+          focusCell(row, previousColumn)
+          break
+        }
+      }
     }
-  }, [focusCell, height, width])
+  }, [focusCell, height, hintTiles, width])
 
   function handleWidthChange(value: string) {
     setPendingWidth(value)
@@ -181,9 +330,12 @@ function App() {
         cell !== '.' && (rowIndex >= nextHeight || columnIndex >= nextWidth)
       ))
     ))
+    const removesHints = Object.values(hintTiles).some(
+      ({ row, column }) => row >= nextHeight || column >= nextWidth,
+    )
     if (
-      removesLetters
-      && !window.confirm('Resizing will remove letters outside the new grid and may cut words. Continue?')
+      (removesLetters || removesHints)
+      && !window.confirm('Resizing will remove letters or hints outside the new grid and may cut words. Continue?')
     ) {
       setPendingWidth(String(width))
       setPendingHeight(String(height))
@@ -198,6 +350,24 @@ function App() {
           : `${row.slice(0, nextWidth)}${'.'.repeat(MAX_DIMENSION - nextWidth)}`
       )))
     }
+
+    setHintTiles((current) => {
+      const nextTiles: Record<string, HintTile> = {}
+      for (const [key, tile] of Object.entries(current)) {
+        if (tile.row < nextHeight && tile.column < nextWidth) {
+          nextTiles[key] = tile
+        }
+      }
+
+      for (const [key, tile] of Object.entries(createDefaultHintTiles(nextWidth, nextHeight))) {
+        const newlyAddedEdge = tile.row >= height || tile.column >= width
+        if (newlyAddedEdge && !nextTiles[key]) {
+          nextTiles[key] = tile
+        }
+      }
+
+      return nextTiles
+    })
 
     setWidth(nextWidth)
     setHeight(nextHeight)
@@ -243,6 +413,7 @@ function App() {
           width,
           height,
           cells: cells.slice(0, height).map((row) => row.slice(0, width)),
+          hints: Object.values(hintTiles),
         }),
       })
       const result = await response.json() as {
@@ -268,6 +439,119 @@ function App() {
     } finally {
       setIsSaving(false)
     }
+  }
+
+  async function uploadHintImage(image: Blob) {
+    const formData = new FormData()
+    formData.append('image', image, 'hint.png')
+
+    const response = await fetch('/api/hint-images', {
+      method: 'POST',
+      body: formData,
+    })
+    const result = await response.json() as {
+      id?: string
+      detail?: string
+      title?: string
+    }
+    if (!response.ok) {
+      throw new Error(result.detail ?? result.title ?? `Image upload failed (${response.status})`)
+    }
+    if (!result.id) {
+      throw new Error('The server returned an invalid image confirmation.')
+    }
+
+    return result.id
+  }
+
+  function handleHintTileClick(row: number, column: number, value: string) {
+    const key = hintPositionKey(row, column)
+    const existingTile = hintTiles[key]
+    if (existingTile) {
+      setActiveHint({
+        row,
+        column,
+        direction: existingTile.direction,
+      })
+      return
+    }
+
+    if (
+      value !== '.'
+      && !window.confirm('This square contains a letter. Convert it to a hint tile and erase the letter?')
+    ) {
+      return
+    }
+
+    setCells((current) => current.map((currentRow, rowIndex) => (
+      rowIndex === row
+        ? `${currentRow.slice(0, column)}.${currentRow.slice(column + 1)}`
+        : currentRow
+    )))
+    setHintTiles((current) => ({
+      ...current,
+      [key]: {
+        row,
+        column,
+        direction: 'across',
+        imageId: null,
+      },
+    }))
+    setSavedPuzzle(null)
+    setError(null)
+    setActiveHint({ row, column, direction: 'across' })
+  }
+
+  function handleHintDirectionChange(direction: ActiveHint['direction']) {
+    if (!activeHint) {
+      return
+    }
+
+    const key = hintPositionKey(activeHint.row, activeHint.column)
+    setHintTiles((current) => {
+      const tile = current[key]
+      return tile ? { ...current, [key]: { ...tile, direction } } : current
+    })
+    setActiveHint((current) => (current ? { ...current, direction } : current))
+    setSavedPuzzle(null)
+  }
+
+  function handleHintSaved(imageId: string) {
+    if (!activeHint) {
+      return
+    }
+
+    const key = hintPositionKey(activeHint.row, activeHint.column)
+    setHintTiles((current) => {
+      const tile = current[key]
+      return tile ? { ...current, [key]: { ...tile, imageId } } : current
+    })
+    setSavedPuzzle(null)
+    setError(null)
+    setActiveHint(null)
+  }
+
+  function removeActiveHint() {
+    if (!activeHint) {
+      return
+    }
+
+    const key = hintPositionKey(activeHint.row, activeHint.column)
+    const tile = hintTiles[key]
+    if (
+      tile?.imageId
+      && !window.confirm('This hint already has an image saved. Remove the hint from this grid?')
+    ) {
+      return
+    }
+
+    setHintTiles((current) => {
+      const updated = { ...current }
+      delete updated[key]
+      return updated
+    })
+    setSavedPuzzle(null)
+    setActiveHint(null)
   }
 
   return (
@@ -298,7 +582,7 @@ function App() {
               <h2 id="editor-title">Build your grid</h2>
             </div>
             <p className="editor-hint">
-              Start with a blank grid, then fill in letters. Resizing warns before removing letters.
+              Use the hint tool on any square to replace it with an across or down clue tile. Resizing warns before removing content.
             </p>
           </div>
 
@@ -349,7 +633,19 @@ function App() {
 
           <div className="grid-heading">
             <span>{width} × {height} squares</span>
-            <span>Type A–Z · arrows move between squares</span>
+            <span>Type A–Z or Nordic letters · arrows move between squares</span>
+          </div>
+
+          <div className="editor-tools">
+            <button
+              className={`secondary-button${isHintToolActive ? ' secondary-button--selected' : ''}`}
+              type="button"
+              aria-pressed={isHintToolActive}
+              onClick={() => setIsHintToolActive((current) => !current)}
+            >
+              Hint tool <kbd>H</kbd>
+            </button>
+            <span>The left column starts with Across hints; the top row starts with Down hints. Use the hint tool to edit them or add a hint anywhere. Press Esc to return to letters.</span>
           </div>
 
           <div className="grid-viewport" aria-label="Crossword grid">
@@ -358,16 +654,39 @@ function App() {
               style={{ gridTemplateColumns: `repeat(${width}, 34px)` }}
             >
               {cells.slice(0, height).flatMap((row, rowIndex) => (
-                Array.from(row.slice(0, width), (value, columnIndex) => (
-                <GridCell
-                  key={`${rowIndex}-${columnIndex}`}
-                  row={rowIndex}
-                  column={columnIndex}
-                  value={value}
-                  onChange={handleCellChange}
-                  onKeyDown={handleCellKeyDown}
-                />
-                ))
+                Array.from(row.slice(0, width), (value, columnIndex) => {
+                  const key = hintPositionKey(rowIndex, columnIndex)
+                  const tile = hintTiles[key]
+                  if (tile) {
+                    return (
+                      <HintTileCell
+                        key={key}
+                        row={rowIndex}
+                        column={columnIndex}
+                        tile={tile}
+                        enabled={isHintToolActive}
+                        onClick={() => setActiveHint({
+                          row: rowIndex,
+                          column: columnIndex,
+                          direction: tile.direction,
+                        })}
+                      />
+                    )
+                  }
+
+                  return (
+                    <GridCell
+                      key={key}
+                      row={rowIndex}
+                      column={columnIndex}
+                      value={value}
+                      hintToolActive={isHintToolActive}
+                      onChange={handleCellChange}
+                      onKeyDown={handleCellKeyDown}
+                      onHintClick={handleHintTileClick}
+                    />
+                  )
+                })
               ))}
             </div>
           </div>
@@ -392,6 +711,19 @@ function App() {
           </div>
         </section>
       </div>
+      {activeHint && (
+        <HintEditor
+          title={`Hint · Row ${activeHint.row + 1}, Column ${activeHint.column + 1}`}
+          direction={activeHint.direction}
+          imageId={hintTiles[hintPositionKey(activeHint.row, activeHint.column)]?.imageId ?? undefined}
+          onCancel={() => setActiveHint(null)}
+          onEscape={() => setIsHintToolActive(false)}
+          onDirectionChange={handleHintDirectionChange}
+          onSave={uploadHintImage}
+          onSaved={handleHintSaved}
+          onRemove={removeActiveHint}
+        />
+      )}
     </main>
   )
 }

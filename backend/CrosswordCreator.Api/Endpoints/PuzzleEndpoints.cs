@@ -6,6 +6,7 @@ namespace CrosswordCreator.Api.Endpoints;
 
 public static class PuzzleEndpoints
 {
+    private const int CurrentSchemaVersion = 3;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public static IEndpointRouteBuilder MapPuzzleEndpoints(this IEndpointRouteBuilder endpoints)
@@ -20,6 +21,7 @@ public static class PuzzleEndpoints
     private static async Task<IResult> CreateAsync(
         CreatePuzzleRequest request,
         PuzzleDbContext dbContext,
+        IWebHostEnvironment environment,
         CancellationToken cancellationToken)
     {
         var errors = new Dictionary<string, string[]>();
@@ -71,15 +73,29 @@ public static class PuzzleEndpoints
 
             var normalizedRow = row.ToUpperInvariant();
             if (normalizedRow.Length != request.Width
-                || normalizedRow.Any(character => character != '.' && !char.IsAsciiLetterUpper(character)))
+                || normalizedRow.Any(character => character != '.' && !IsPuzzleLetter(character)))
             {
-                errors[$"cells[{rowIndex}]"] = ["Cells may contain only letters A-Z or '.' for an empty square."];
+                errors[$"cells[{rowIndex}]"] = [
+                    "Cells may contain only letters A-Z or Nordic letters Å, Ä, Ö, Æ, Ø, Ð, Þ, or '.' for an empty square."
+                ];
                 continue;
             }
 
             normalizedCells[rowIndex] = normalizedRow;
         }
 
+        if (errors.Count > 0)
+        {
+            return Results.ValidationProblem(errors);
+        }
+
+        var normalizedHints = NormalizeHints(
+            request.Hints,
+            request.Width,
+            request.Height,
+            normalizedCells,
+            environment,
+            errors);
         if (errors.Count > 0)
         {
             return Results.ValidationProblem(errors);
@@ -93,7 +109,10 @@ public static class PuzzleEndpoints
             CreatedUtc = now,
             UpdatedUtc = now,
             ContentJson = JsonSerializer.Serialize(
-                new PuzzleDocument(1, request.Width, request.Height, normalizedCells),
+                new PuzzleDocument(CurrentSchemaVersion, request.Width, request.Height, normalizedCells)
+                {
+                    Hints = normalizedHints.ToArray()
+                },
                 JsonOptions)
         };
 
@@ -105,10 +124,85 @@ public static class PuzzleEndpoints
             puzzle.Title,
             puzzle.CreatedUtc,
             puzzle.UpdatedUtc,
-            new PuzzleDocument(1, request.Width, request.Height, normalizedCells));
+            new PuzzleDocument(CurrentSchemaVersion, request.Width, request.Height, normalizedCells)
+            {
+                Hints = normalizedHints.ToArray()
+            });
 
         return Results.Created($"/api/puzzles/{puzzle.Id}", response);
     }
+
+    private static List<PuzzleHint> NormalizeHints(
+        PuzzleHint?[]? hints,
+        int width,
+        int height,
+        string[] cells,
+        IWebHostEnvironment environment,
+        Dictionary<string, string[]> errors)
+    {
+        var normalizedHints = new List<PuzzleHint>();
+        if (hints is null)
+        {
+            return normalizedHints;
+        }
+
+        var occupiedSquares = new HashSet<(int Row, int Column)>();
+        foreach (var hint in hints)
+        {
+            if (hint is null
+                || hint.Row < 0
+                || hint.Row >= height
+                || hint.Column < 0
+                || hint.Column >= width)
+            {
+                errors["hints"] = ["Hint tiles must refer to a square in the grid."];
+                continue;
+            }
+
+            if (hint.Direction is not ("across" or "down"))
+            {
+                errors["hints"] = ["Hint direction must be 'across' or 'down'."];
+                continue;
+            }
+
+            if (cells[hint.Row][hint.Column] != '.')
+            {
+                errors["hints"] = ["Hint tiles cannot also contain letters."];
+                continue;
+            }
+
+            if (!occupiedSquares.Add((hint.Row, hint.Column)))
+            {
+                errors["hints"] = ["A square can contain only one hint tile."];
+                continue;
+            }
+
+            string? imageId = null;
+            if (hint.ImageId is not null)
+            {
+                if (!Guid.TryParseExact(hint.ImageId, "N", out var id)
+                    || !HintImageStore.TryGetImage(environment, id, out _, out _))
+                {
+                    errors["hints"] = ["Each hint image must refer to an uploaded image."];
+                    continue;
+                }
+
+                imageId = id.ToString("N");
+            }
+
+            normalizedHints.Add(new PuzzleHint(
+                hint.Row,
+                hint.Column,
+                hint.Direction,
+                imageId));
+        }
+
+        return normalizedHints;
+    }
+
+    private static bool IsPuzzleLetter(char character) =>
+        char.IsAsciiLetterUpper(character)
+        || character is 'Å' or 'Ä' or 'Ö' or 'Æ' or 'Ø' or 'Ð' or 'Þ';
 
     private static async Task<IResult> GetByIdAsync(
         Guid id,
@@ -139,9 +233,19 @@ public static class PuzzleEndpoints
     }
 }
 
-public sealed record CreatePuzzleRequest(string? Title, int Width, int Height, string?[]? Cells);
+public sealed record CreatePuzzleRequest(
+    string? Title,
+    int Width,
+    int Height,
+    string?[]? Cells,
+    PuzzleHint?[]? Hints = null);
 
-public sealed record PuzzleDocument(int SchemaVersion, int Width, int Height, string[] Cells);
+public sealed record PuzzleDocument(int SchemaVersion, int Width, int Height, string[] Cells)
+{
+    public PuzzleHint[] Hints { get; init; } = [];
+}
+
+public sealed record PuzzleHint(int Row, int Column, string Direction, string? ImageId);
 
 public sealed record PuzzleResponse(
     Guid Id,

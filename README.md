@@ -27,13 +27,24 @@ Open the URL printed by Vite (by default, `http://localhost:5173`). The frontend
 
 The starter API exposes `GET /api/health`.
 Crosswords can be saved with `POST /api/puzzles` and retrieved by ID with
-`GET /api/puzzles/{id}`. Grid dimensions must be between 1 and 100; saved rows
-contain uppercase letters, with `.` representing an empty square.
+`GET /api/puzzles/{id}`. Hint images use `POST /api/hint-images` and can be
+retrieved with `GET /api/hint-images/{id}`. Grid dimensions must be between 1
+and 100; saved rows contain uppercase letters A-Z and Nordic letters Å, Ä, Ö,
+Æ, Ø, Ð, Þ, with `.` representing an empty square. Press H to toggle the hint
+tool, then click any square to replace it with an across or down hint tile.
+The left column starts with Across hint tiles and the top row starts with Down
+hint tiles; the top-left square is Across. Newly added squares along those
+edges get the same defaults. Escape returns to letter entry. Empty hint tiles
+can be removed directly, while removing a tile with a saved image asks for
+confirmation. Hint images can be uploaded or drawn with text in the editor,
+then attached to a puzzle when it is saved.
 
 The API creates and updates its SQLite database on startup at
 `backend\CrosswordCreator.Api\App_Data\crosswordcreator.db`. Puzzle records are
 stored in the `Puzzles` table; the grid and entries are kept as JSON in
-`ContentJson`. The database file is local and is excluded from Git.
+`ContentJson`. Uploaded hint images are stored locally under
+`backend\CrosswordCreator.Api\App_Data\HintImages` (PNG, JPEG, or WebP, up to
+5 MB each). The database and hint images are local and excluded from Git.
 
 To add a schema migration after changing the data model:
 
