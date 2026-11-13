@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import HintEditor from './HintEditor'
 
@@ -18,6 +18,7 @@ interface GridCellProps {
   row: number
   column: number
   value: string
+  tabIndex: number
   hintToolActive: boolean
   onChange: (row: number, column: number, value: string) => void
   onKeyDown: (row: number, column: number, value: string, event: KeyboardEvent<HTMLInputElement>) => void
@@ -74,10 +75,39 @@ function hintPositionKey(row: number, column: number) {
   return `${row}:${column}`
 }
 
+function getGridTraversalOrder(
+  width: number,
+  height: number,
+  hintTiles: Record<string, HintTile>,
+  direction: 'right' | 'down',
+) {
+  const cells: Array<{ row: number; column: number }> = []
+  if (direction === 'down') {
+    for (let column = 0; column < width; column += 1) {
+      for (let row = 0; row < height; row += 1) {
+        if (!hintTiles[hintPositionKey(row, column)]) {
+          cells.push({ row, column })
+        }
+      }
+    }
+  } else {
+    for (let row = 0; row < height; row += 1) {
+      for (let column = 0; column < width; column += 1) {
+        if (!hintTiles[hintPositionKey(row, column)]) {
+          cells.push({ row, column })
+        }
+      }
+    }
+  }
+
+  return cells
+}
+
 const GridCell = memo(function GridCell({
   row,
   column,
   value,
+  tabIndex,
   hintToolActive,
   onChange,
   onKeyDown,
@@ -91,6 +121,7 @@ const GridCell = memo(function GridCell({
       inputMode="text"
       autoComplete="off"
       maxLength={1}
+      tabIndex={tabIndex}
       aria-label={`Row ${row + 1}, column ${column + 1}`}
       value={value === '.' ? '' : value}
       onClick={(event) => {
@@ -143,6 +174,7 @@ function App() {
   const [hintTiles, setHintTiles] = useState<Record<string, HintTile>>(
     () => createDefaultHintTiles(10, 10),
   )
+  const [tabDirection, setTabDirection] = useState<'right' | 'down'>('right')
   const [isHintToolActive, setIsHintToolActive] = useState(false)
   const [activeHint, setActiveHint] = useState<ActiveHint | null>(null)
   const [apiHealth, setApiHealth] = useState<ApiHealth | null>(null)
@@ -150,6 +182,8 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [savedPuzzle, setSavedPuzzle] = useState<SavedPuzzle | null>(null)
   const [isSaving, setIsSaving] = useState(false)
+  const tabDirectionButtonRef = useRef<HTMLButtonElement>(null)
+  const saveCrosswordButtonRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -188,7 +222,8 @@ function App() {
         return
       }
 
-      if (event.key.toLowerCase() !== 'h' || event.repeat) {
+      const shortcut = event.key.toLowerCase()
+      if ((shortcut !== 'h' && shortcut !== 'u') || event.repeat) {
         return
       }
 
@@ -206,8 +241,21 @@ function App() {
         return
       }
 
+      const isGridCell = target instanceof HTMLInputElement && target.classList.contains('grid-cell')
+      if (isGridCell) {
+        if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+          return
+        }
+      } else if (event.altKey || event.ctrlKey || event.metaKey) {
+        return
+      }
+
       event.preventDefault()
-      setIsHintToolActive((current) => !current)
+      if (shortcut === 'h') {
+        setIsHintToolActive((current) => !current)
+      } else {
+        setTabDirection((current) => (current === 'right' ? 'down' : 'right'))
+      }
     }
 
     window.addEventListener('keydown', handleShortcut)
@@ -237,22 +285,14 @@ function App() {
     setError(null)
 
     if (value) {
-      let nextRow = row
-      let nextColumn = column + 1
-      while (nextRow < height) {
-        while (nextColumn < width) {
-          if (!hintTiles[hintPositionKey(nextRow, nextColumn)]) {
-            focusCell(nextRow, nextColumn)
-            return
-          }
-          nextColumn += 1
-        }
-
-        nextRow += 1
-        nextColumn = 0
+      const traversalOrder = getGridTraversalOrder(width, height, hintTiles, tabDirection)
+      const currentIndex = traversalOrder.findIndex((cell) => cell.row === row && cell.column === column)
+      const nextCell = traversalOrder[currentIndex + 1]
+      if (nextCell) {
+        focusCell(nextCell.row, nextCell.column)
       }
     }
-  }, [focusCell, height, hintTiles, width])
+  }, [focusCell, height, hintTiles, tabDirection, width])
 
   const handleCellKeyDown = useCallback((
     row: number,
@@ -260,6 +300,23 @@ function App() {
     value: string,
     event: KeyboardEvent<HTMLInputElement>,
   ) => {
+    if (event.key === 'Tab' && tabDirection === 'down' && !isHintToolActive) {
+      const tabOrder = getGridTraversalOrder(width, height, hintTiles, 'down')
+      const currentIndex = tabOrder.findIndex((cell) => cell.row === row && cell.column === column)
+      if (currentIndex !== -1) {
+        event.preventDefault()
+        const nextCell = tabOrder[currentIndex + (event.shiftKey ? -1 : 1)]
+        if (nextCell) {
+          focusCell(nextCell.row, nextCell.column)
+        } else if (event.shiftKey) {
+          tabDirectionButtonRef.current?.focus()
+        } else {
+          saveCrosswordButtonRef.current?.focus()
+        }
+      }
+      return
+    }
+
     const movement: Record<string, [number, number]> = {
       ArrowLeft: [0, -1],
       ArrowRight: [0, 1],
@@ -281,16 +338,23 @@ function App() {
         nextRow += direction[0]
         nextColumn += direction[1]
       }
-    } else if (event.key === 'Backspace' && value === '.' && column > 0) {
-      for (let previousColumn = column - 1; previousColumn >= 0; previousColumn -= 1) {
-        if (!hintTiles[hintPositionKey(row, previousColumn)]) {
-          event.preventDefault()
-          focusCell(row, previousColumn)
-          break
-        }
+    } else if (event.key === 'Backspace' && value === '.') {
+      const traversalOrder = getGridTraversalOrder(width, height, hintTiles, tabDirection)
+      const currentIndex = traversalOrder.findIndex((cell) => cell.row === row && cell.column === column)
+      const previousCell = traversalOrder[currentIndex - 1]
+      if (previousCell) {
+        event.preventDefault()
+        focusCell(previousCell.row, previousCell.column)
       }
     }
-  }, [focusCell, height, hintTiles, width])
+  }, [focusCell, height, hintTiles, isHintToolActive, tabDirection, width])
+
+  const verticalTabOrder = tabDirection === 'down' && !isHintToolActive
+    ? getGridTraversalOrder(width, height, hintTiles, 'down')
+    : []
+  const verticalTabFirstCellKey = verticalTabOrder.length > 0
+    ? hintPositionKey(verticalTabOrder[0].row, verticalTabOrder[0].column)
+    : null
 
   function handleWidthChange(value: string) {
     setPendingWidth(value)
@@ -640,12 +704,25 @@ function App() {
             <button
               className={`secondary-button${isHintToolActive ? ' secondary-button--selected' : ''}`}
               type="button"
+              aria-label="Toggle hint tool (H outside editable fields; Alt+H in grid cells)"
+              title="Press H outside editable fields, or Alt+H in a grid cell, to toggle the hint tool"
               aria-pressed={isHintToolActive}
               onClick={() => setIsHintToolActive((current) => !current)}
             >
               Hint tool <kbd>H</kbd>
             </button>
-            <span>The left column starts with Across hints; the top row starts with Down hints. Use the hint tool to edit them or add a hint anywhere. Press Esc to return to letters.</span>
+            <button
+              ref={tabDirectionButtonRef}
+              className={`secondary-button${tabDirection === 'down' ? ' secondary-button--selected' : ''}`}
+              type="button"
+              aria-label={`Tab moves ${tabDirection}; press U outside editable fields or Alt+U in a grid cell to switch direction`}
+              aria-pressed={tabDirection === 'down'}
+              title="Press U outside editable fields, or Alt+U in a grid cell, to switch Tab direction"
+              onClick={() => setTabDirection((current) => (current === 'right' ? 'down' : 'right'))}
+            >
+              Tab: {tabDirection === 'right' ? 'Right' : 'Down'} <kbd>U</kbd>
+            </button>
+            <span>The left column starts with Across hints; the top row starts with Down hints. Use the hint tool to edit them or add a hint anywhere. Press Esc to return to letters. Use Alt+H/Alt+U in a grid square so H/U remain available as letters.</span>
           </div>
 
           <div className="grid-viewport" aria-label="Crossword grid">
@@ -680,6 +757,10 @@ function App() {
                       row={rowIndex}
                       column={columnIndex}
                       value={value}
+                      tabIndex={verticalTabOrder.length === 0
+                        || key === verticalTabFirstCellKey
+                        ? 0
+                        : -1}
                       hintToolActive={isHintToolActive}
                       onChange={handleCellChange}
                       onKeyDown={handleCellKeyDown}
@@ -701,6 +782,7 @@ function App() {
               )}
             </div>
             <button
+              ref={saveCrosswordButtonRef}
               className="primary-button"
               type="button"
               disabled={isSaving}
